@@ -47,7 +47,14 @@ type Source interface {
 	CopyTable(ctx context.Context, schema, table, snapshotName string) ([]map[string]any, []ColumnInfo, error)
 
 	// Streaming
-	Stream(ctx context.Context, slotName, pubName, startLSN string, events chan<- CDCEvent) error
+	//
+	// Stream replays WAL starting at startLSN. durableLSN, when non-nil, is
+	// consulted before every standby status update: the replication slot's
+	// confirmed_flush_lsn must never advance past a position that is not yet
+	// durable in the sink (delta files + manifest committed). Passing nil
+	// pins feedback at startLSN, which is always safe because Postgres
+	// retains everything above it.
+	Stream(ctx context.Context, slotName, pubName, startLSN string, events chan<- CDCEvent, durableLSN func() string) error
 
 	// Governance
 	BuildRoleProfiles(ctx context.Context, roles []string) (map[string]RoleProfile, error)

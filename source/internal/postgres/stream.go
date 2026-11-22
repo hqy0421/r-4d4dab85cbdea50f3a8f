@@ -21,7 +21,13 @@ type CDCEvent struct {
 
 // Stream starts logical replication and sends decoded events to the channel.
 // The channel is closed when Stream returns. Blocks until ctx is cancelled.
-func (c *Conn) Stream(ctx context.Context, slotName, publicationName, startLSN string, events chan<- CDCEvent) error {
+//
+// durableLSN (may be nil) returns the highest LSN known to be durably
+// committed in the sink. Standby feedback only ever reports that position —
+// the WAL Postgres has merely sent (serverWALEnd) is used for keepalive
+// timeout tracking but is never confirmed back, so Postgres cannot release
+// WAL pg-cdc would need to replay after a crash.
+func (c *Conn) Stream(ctx context.Context, slotName, publicationName, startLSN string, events chan<- CDCEvent, durableLSN func() string) error {
 	defer close(events)
 
 	replConn, err := c.connectReplication(ctx)
@@ -47,25 +53,45 @@ func (c *Conn) Stream(ctx context.Context, slotName, publicationName, startLSN s
 		return fmt.Errorf("start replication: %w", err)
 	}
 
-	// Immediate standby status to prevent wal_sender_timeout
+	// feedbackPosition is the only LSN we ever confirm to Postgres. It
+	// starts at the replication start point and moves forward strictly as
+	// batches become durable in the sink.
+	feedbackPosition := lsn
+	resolveFeedback := func() pglogrepl.LSN {
+		if durableLSN == nil {
+			return feedbackPosition
+		}
+		raw := durableLSN()
+		if raw == "" {
+			return feedbackPosition
+		}
+		parsed, perr := pglogrepl.ParseLSN(raw)
+		if perr != nil || parsed <= feedbackPosition {
+			return feedbackPosition
+		}
+		feedbackPosition = parsed
+		return feedbackPosition
+	}
+
+	// Immediate standby status to prevent wal_sender_timeout.
 	_ = pglogrepl.SendStandbyStatusUpdate(ctx, replConn,
-		pglogrepl.StandbyStatusUpdate{WALWritePosition: lsn})
+		pglogrepl.StandbyStatusUpdate{WALWritePosition: resolveFeedback()})
 
 	standbyDeadline := time.Now().Add(10 * time.Second)
-	serverWALEnd := lsn
 	decoder := newDecoder()
 
 	for {
 		if ctx.Err() != nil {
 			_ = pglogrepl.SendStandbyStatusUpdate(ctx, replConn,
-				pglogrepl.StandbyStatusUpdate{WALWritePosition: serverWALEnd})
+				pglogrepl.StandbyStatusUpdate{WALWritePosition: resolveFeedback()})
 			return ctx.Err()
 		}
 
-		// Periodic standby status
+		// Periodic standby status — always the durable position, never the
+		// server's WAL end.
 		if time.Now().After(standbyDeadline) {
 			if err := pglogrepl.SendStandbyStatusUpdate(ctx, replConn,
-				pglogrepl.StandbyStatusUpdate{WALWritePosition: serverWALEnd}); err != nil {
+				pglogrepl.StandbyStatusUpdate{WALWritePosition: resolveFeedback()}); err != nil {
 				return fmt.Errorf("standby status: %w", err)
 			}
 			standbyDeadline = time.Now().Add(10 * time.Second)
@@ -97,22 +123,18 @@ func (c *Conn) Stream(ctx context.Context, slotName, publicationName, startLSN s
 			if err != nil {
 				return fmt.Errorf("parse keepalive: %w", err)
 			}
-			if pkm.ServerWALEnd > serverWALEnd {
-				serverWALEnd = pkm.ServerWALEnd
-			}
 			if pkm.ReplyRequested {
 				standbyDeadline = time.Time{}
+				if err := pglogrepl.SendStandbyStatusUpdate(ctx, replConn,
+					pglogrepl.StandbyStatusUpdate{WALWritePosition: resolveFeedback()}); err != nil {
+					return fmt.Errorf("standby status (reply requested): %w", err)
+				}
 			}
 
 		case pglogrepl.XLogDataByteID:
 			xld, err := pglogrepl.ParseXLogData(msg.Data[1:])
 			if err != nil {
 				return fmt.Errorf("parse xlog: %w", err)
-			}
-
-			walEnd := xld.WALStart + pglogrepl.LSN(len(xld.WALData))
-			if walEnd > serverWALEnd {
-				serverWALEnd = walEnd
 			}
 
 			evt, err := decoder.decode(xld.WALData, xld.WALStart.String(), xld.ServerTime)
@@ -128,20 +150,4 @@ func (c *Conn) Stream(ctx context.Context, slotName, publicationName, startLSN s
 			}
 		}
 	}
-}
-
-// ConfirmLSN sends a standby status update confirming the given LSN.
-func (c *Conn) ConfirmLSN(ctx context.Context, lsn string) error {
-	replConn, err := c.connectReplication(ctx)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = replConn.Close(ctx) }()
-
-	parsed, err := pglogrepl.ParseLSN(lsn)
-	if err != nil {
-		return err
-	}
-	return pglogrepl.SendStandbyStatusUpdate(ctx, replConn,
-		pglogrepl.StandbyStatusUpdate{WALWritePosition: parsed})
 }

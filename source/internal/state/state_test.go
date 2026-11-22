@@ -97,7 +97,7 @@ func TestEpochState(t *testing.T) {
 	}
 
 	// Open epoch
-	ep, err := s.OpenEpoch(ctx, 1, "0/1000")
+	ep, err := s.OpenEpoch(ctx, 1, "0/1000", "0/2000")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,6 +106,31 @@ func TestEpochState(t *testing.T) {
 	}
 	if ep.Status != "open" {
 		t.Errorf("status = %q", ep.Status)
+	}
+	if ep.EndLSN != "0/2000" {
+		t.Errorf("end_lsn = %q", ep.EndLSN)
+	}
+
+	// Record files for the epoch.
+	if err := s.RecordEpochFile(ctx, 1, "public.orders", "public.orders/deltas/epoch=000001.parquet"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordEpochFile(ctx, 1, "public.items", "public.items/deltas/epoch=000001.parquet"); err != nil {
+		t.Fatal(err)
+	}
+	files, err := s.GetEpochFiles(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 2 {
+		t.Fatalf("epoch files = %d, want 2", len(files))
+	}
+	got, err := s.GetEpoch(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.EpochNumber != 1 {
+		t.Fatalf("GetEpoch = %+v", got)
 	}
 
 	// Commit
@@ -120,6 +145,17 @@ func TestEpochState(t *testing.T) {
 	}
 	if latest.RowCount != 42 {
 		t.Errorf("row_count = %d", latest.RowCount)
+	}
+
+	// DeleteEpoch drops both the row and its file records.
+	if err := s.DeleteEpoch(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	if gone, _ := s.GetEpoch(ctx, 1); gone != nil {
+		t.Errorf("epoch still present after delete: %+v", gone)
+	}
+	if left, _ := s.GetEpochFiles(ctx, 1); len(left) != 0 {
+		t.Errorf("epoch files left after delete: %d", len(left))
 	}
 }
 

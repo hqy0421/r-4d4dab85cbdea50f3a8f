@@ -17,8 +17,8 @@ var cfgFile string
 
 func main() {
 	root := &cobra.Command{
-		Use:   "pg-cdc",
-		Short: "PostgreSQL CDC server — WAL streaming to typed Parquet",
+		Use:               "pg-cdc",
+		Short:             "PostgreSQL CDC server — WAL streaming to typed Parquet",
 		CompletionOptions: cobra.CompletionOptions{DisableDefaultCmd: true},
 	}
 
@@ -80,7 +80,13 @@ func startCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return internal.Start(ctx, cfg, source, sink)
+			// The SQLite journal is the crash-safe batch ledger linking
+			// manifest-committed epochs to the replication slot position.
+			stateStore, err := registry.NewStateStore(cfg.State)
+			if err != nil {
+				return fmt.Errorf("open state store: %w", err)
+			}
+			return internal.Start(ctx, cfg, source, sink, stateStore)
 		},
 	}
 }

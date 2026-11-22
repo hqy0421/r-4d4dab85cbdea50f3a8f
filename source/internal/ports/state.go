@@ -13,7 +13,12 @@ type StateStore interface {
 	SaveReplicationState(ctx context.Context, rs *ReplicationState) error
 
 	// Epoch lifecycle
-	OpenEpoch(ctx context.Context, epochNumber int64, startLSN string) (*EpochState, error)
+	OpenEpoch(ctx context.Context, epochNumber int64, startLSN, endLSN string) (*EpochState, error)
+	UpdateEpochEndLSN(ctx context.Context, epochNumber int64, endLSN string) error
+	RecordEpochFile(ctx context.Context, epochNumber int64, tableName, remotePath string) error
+	GetEpochFiles(ctx context.Context, epochNumber int64) ([]EpochFile, error)
+	GetEpoch(ctx context.Context, epochNumber int64) (*EpochState, error)
+	DeleteEpoch(ctx context.Context, epochNumber int64) error
 	CommitEpoch(ctx context.Context, id int64, endLSN string, rowCount int64) error
 	GetLatestEpoch(ctx context.Context) (*EpochState, error)
 
@@ -49,6 +54,13 @@ type EpochState struct {
 	EndLSN      string
 	RowCount    int64
 	Status      string // "open", "committed", "flushed"
+}
+
+// EpochFile describes one delta file uploaded as part of an epoch batch.
+type EpochFile struct {
+	EpochNumber int64
+	TableName   string
+	RemotePath  string
 }
 
 // TableState holds per-table metadata.

@@ -68,6 +68,13 @@ func (s *Store) migrate() error {
 			row_count INTEGER DEFAULT 0,
 			status TEXT NOT NULL DEFAULT 'open'
 		)`,
+		`CREATE TABLE IF NOT EXISTS epoch_file (
+			epoch_number INTEGER NOT NULL,
+			table_name TEXT NOT NULL,
+			remote_path TEXT NOT NULL,
+			uploaded_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY (epoch_number, table_name)
+		)`,
 		`CREATE TABLE IF NOT EXISTS table_state (
 			table_name TEXT PRIMARY KEY,
 			last_snapshot_lsn TEXT,
@@ -157,11 +164,14 @@ type EpochState struct {
 	Status      string // "open", "committed", "flushed"
 }
 
-// OpenEpoch creates a new epoch and returns it.
-func (s *Store) OpenEpoch(ctx context.Context, epochNumber int64, startLSN string) (*EpochState, error) {
+// OpenEpoch creates a new epoch and returns it. startLSN is the replication
+// position at which the batch began (exclusive); endLSN is the highest LSN
+// buffered into the batch, recorded up front so a crash before commit still
+// leaves the batch boundaries on disk for replay.
+func (s *Store) OpenEpoch(ctx context.Context, epochNumber int64, startLSN, endLSN string) (*EpochState, error) {
 	result, err := s.db.ExecContext(ctx,
-		`INSERT INTO epoch_state (epoch_number, start_lsn, status) VALUES (?, ?, 'open')`,
-		epochNumber, startLSN)
+		`INSERT INTO epoch_state (epoch_number, start_lsn, end_lsn, status) VALUES (?, ?, ?, 'open')`,
+		epochNumber, startLSN, endLSN)
 	if err != nil {
 		return nil, err
 	}
@@ -170,9 +180,92 @@ func (s *Store) OpenEpoch(ctx context.Context, epochNumber int64, startLSN strin
 		ID:          id,
 		EpochNumber: epochNumber,
 		StartLSN:    startLSN,
+		EndLSN:      endLSN,
 		Status:      "open",
 		StartedAt:   time.Now(),
 	}, nil
+}
+
+// UpdateEpochEndLSN records the highest LSN buffered into an open batch. The
+// value moves forward as more events accumulate before the flush.
+func (s *Store) UpdateEpochEndLSN(ctx context.Context, epochNumber int64, endLSN string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE epoch_state SET end_lsn = ? WHERE epoch_number = ? AND status = 'open'`,
+		endLSN, epochNumber)
+	return err
+}
+
+// RecordEpochFile marks a delta file as durably uploaded for an open batch.
+// Re-registering the same (epoch, table) pair after a replay simply refreshes
+// the timestamp, which makes batch replay idempotent.
+func (s *Store) RecordEpochFile(ctx context.Context, epochNumber int64, tableName, remotePath string) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO epoch_file (epoch_number, table_name, remote_path)
+		 VALUES (?, ?, ?)
+		 ON CONFLICT(epoch_number, table_name) DO UPDATE SET
+		   remote_path = excluded.remote_path,
+		   uploaded_at = datetime('now')`,
+		epochNumber, tableName, remotePath)
+	return err
+}
+
+// EpochFile describes one delta file belonging to a batch.
+type EpochFile struct {
+	EpochNumber int64
+	TableName   string
+	RemotePath  string
+}
+
+// GetEpochFiles returns the uploaded delta files recorded for an epoch.
+func (s *Store) GetEpochFiles(ctx context.Context, epochNumber int64) ([]EpochFile, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT epoch_number, table_name, remote_path FROM epoch_file
+		 WHERE epoch_number = ? ORDER BY table_name`, epochNumber)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []EpochFile
+	for rows.Next() {
+		var f EpochFile
+		if err := rows.Scan(&f.EpochNumber, &f.TableName, &f.RemotePath); err != nil {
+			return nil, err
+		}
+		out = append(out, f)
+	}
+	return out, rows.Err()
+}
+
+// GetEpoch returns the state row for a specific epoch number, or nil if absent.
+func (s *Store) GetEpoch(ctx context.Context, epochNumber int64) (*EpochState, error) {
+	var es EpochState
+	var committedAt sql.NullTime
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, epoch_number, started_at, committed_at, COALESCE(start_lsn, ''), COALESCE(end_lsn, ''), row_count, status
+		 FROM epoch_state WHERE epoch_number = ?`, epochNumber).
+		Scan(&es.ID, &es.EpochNumber, &es.StartedAt, &committedAt, &es.StartLSN, &es.EndLSN, &es.RowCount, &es.Status)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if committedAt.Valid {
+		es.CommittedAt = &committedAt.Time
+	}
+	return &es, nil
+}
+
+// DeleteEpoch removes an epoch row and its file records. Used during startup
+// reconciliation when an open batch is replayed under a fresh epoch.
+func (s *Store) DeleteEpoch(ctx context.Context, epochNumber int64) error {
+	if _, err := s.db.ExecContext(ctx,
+		`DELETE FROM epoch_file WHERE epoch_number = ?`, epochNumber); err != nil {
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, `DELETE FROM epoch_state WHERE epoch_number = ?`, epochNumber)
+	return err
 }
 
 // CommitEpoch marks an epoch as committed.
@@ -207,11 +300,11 @@ func (s *Store) GetLatestEpoch(ctx context.Context) (*EpochState, error) {
 
 // TableState holds per-table metadata.
 type TableState struct {
-	TableName      string
+	TableName       string
 	LastSnapshotLSN string
-	RowCount       int64
-	SchemaVersion  int
-	UpdatedAt      time.Time
+	RowCount        int64
+	SchemaVersion   int
+	UpdatedAt       time.Time
 }
 
 // SaveTableState upserts per-table state.

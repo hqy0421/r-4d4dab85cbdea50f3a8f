@@ -3,6 +3,7 @@ package sqlite
 
 import (
 	"context"
+	"sync"
 
 	"github.com/burnside-project/pg-cdc-core/internal/ports"
 	"github.com/burnside-project/pg-cdc-core/internal/state"
@@ -10,7 +11,9 @@ import (
 
 // Adapter wraps the concrete state.Store behind ports.StateStore.
 type Adapter struct {
-	store *state.Store
+	store  *state.Store
+	closed bool
+	mu     sync.Mutex
 }
 
 // Verify interface compliance at compile time.
@@ -52,11 +55,51 @@ func (a *Adapter) SaveReplicationState(ctx context.Context, rs *ports.Replicatio
 	})
 }
 
-func (a *Adapter) OpenEpoch(ctx context.Context, epochNumber int64, startLSN string) (*ports.EpochState, error) {
-	es, err := a.store.OpenEpoch(ctx, epochNumber, startLSN)
+func (a *Adapter) OpenEpoch(ctx context.Context, epochNumber int64, startLSN, endLSN string) (*ports.EpochState, error) {
+	es, err := a.store.OpenEpoch(ctx, epochNumber, startLSN, endLSN)
 	if err != nil {
 		return nil, err
 	}
+	return toPortEpoch(es), nil
+}
+
+func (a *Adapter) UpdateEpochEndLSN(ctx context.Context, epochNumber int64, endLSN string) error {
+	return a.store.UpdateEpochEndLSN(ctx, epochNumber, endLSN)
+}
+
+func (a *Adapter) RecordEpochFile(ctx context.Context, epochNumber int64, tableName, remotePath string) error {
+	return a.store.RecordEpochFile(ctx, epochNumber, tableName, remotePath)
+}
+
+func (a *Adapter) GetEpochFiles(ctx context.Context, epochNumber int64) ([]ports.EpochFile, error) {
+	files, err := a.store.GetEpochFiles(ctx, epochNumber)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ports.EpochFile, len(files))
+	for i, f := range files {
+		out[i] = ports.EpochFile{
+			EpochNumber: f.EpochNumber,
+			TableName:   f.TableName,
+			RemotePath:  f.RemotePath,
+		}
+	}
+	return out, nil
+}
+
+func (a *Adapter) GetEpoch(ctx context.Context, epochNumber int64) (*ports.EpochState, error) {
+	es, err := a.store.GetEpoch(ctx, epochNumber)
+	if err != nil || es == nil {
+		return nil, err
+	}
+	return toPortEpoch(es), nil
+}
+
+func (a *Adapter) DeleteEpoch(ctx context.Context, epochNumber int64) error {
+	return a.store.DeleteEpoch(ctx, epochNumber)
+}
+
+func toPortEpoch(es *state.EpochState) *ports.EpochState {
 	return &ports.EpochState{
 		ID:          es.ID,
 		EpochNumber: es.EpochNumber,
@@ -66,7 +109,7 @@ func (a *Adapter) OpenEpoch(ctx context.Context, epochNumber int64, startLSN str
 		EndLSN:      es.EndLSN,
 		RowCount:    es.RowCount,
 		Status:      es.Status,
-	}, nil
+	}
 }
 
 func (a *Adapter) CommitEpoch(ctx context.Context, id int64, endLSN string, rowCount int64) error {
@@ -78,16 +121,7 @@ func (a *Adapter) GetLatestEpoch(ctx context.Context) (*ports.EpochState, error)
 	if err != nil || es == nil {
 		return nil, err
 	}
-	return &ports.EpochState{
-		ID:          es.ID,
-		EpochNumber: es.EpochNumber,
-		StartedAt:   es.StartedAt,
-		CommittedAt: es.CommittedAt,
-		StartLSN:    es.StartLSN,
-		EndLSN:      es.EndLSN,
-		RowCount:    es.RowCount,
-		Status:      es.Status,
-	}, nil
+	return toPortEpoch(es), nil
 }
 
 func (a *Adapter) SaveTableState(ctx context.Context, ts *ports.TableState) error {
@@ -122,5 +156,11 @@ func (a *Adapter) SaveCompactionState(ctx context.Context, cs *ports.CompactionS
 }
 
 func (a *Adapter) Close() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.closed {
+		return nil
+	}
+	a.closed = true
 	return a.store.Close()
 }

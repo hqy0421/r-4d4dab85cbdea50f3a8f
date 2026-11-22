@@ -4,8 +4,8 @@ package postgres
 import (
 	"context"
 
-	pg "github.com/burnside-project/pg-cdc-core/internal/postgres"
 	"github.com/burnside-project/pg-cdc-core/internal/ports"
+	pg "github.com/burnside-project/pg-cdc-core/internal/postgres"
 )
 
 // Adapter wraps the concrete postgres.Conn behind ports.Source.
@@ -74,13 +74,13 @@ func (a *Adapter) CopyTable(ctx context.Context, schema, table, snapshotName str
 	return rows, out, nil
 }
 
-func (a *Adapter) Stream(ctx context.Context, slotName, pubName, startLSN string, events chan<- ports.CDCEvent) error {
+func (a *Adapter) Stream(ctx context.Context, slotName, pubName, startLSN string, events chan<- ports.CDCEvent, durableLSN func() string) error {
 	// Bridge pg-specific CDCEvent to ports.CDCEvent via an intermediate channel.
 	pgEvents := make(chan pg.CDCEvent, cap(events))
 	errCh := make(chan error, 1)
 
 	go func() {
-		errCh <- a.conn.Stream(ctx, slotName, pubName, startLSN, pgEvents)
+		errCh <- a.conn.Stream(ctx, slotName, pubName, startLSN, pgEvents, durableLSN)
 	}()
 
 	for evt := range pgEvents {
